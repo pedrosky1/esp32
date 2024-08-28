@@ -1,0 +1,375 @@
+#include "Arduino.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+// Definir los pines
+#define BUTTON_PIN 14          // Botón para encender/apagar el motor
+#define SPEED_BUTTON_PIN 12    // Botón para cambiar la velocidad del motor
+#define DECREASE_BUTTON_PIN 5    // Botón para disminuir la velocidad del motor
+#define BLUE_LED_PIN 26        // LED azul
+#define GREEN_LED_PIN 15       // LED verde
+#define RED_LED_PIN 33         // LED rojo
+#define MOTOR_PIN1 27          // Pin de control IN1 del L293D
+#define MOTOR_PIN2 25          // Pin de control IN2 del L293D
+#define MOTOR_ENABLE_PIN 32    // Pin de Enable (PWM) del L293D
+#define PWM_CHANNEL 0          // Canal PWM
+#define BUZZER_PIN 4           // Pin para el buzzer
+#define HALL_SENSOR_PIN 13     // Pin del sensor Hall
+
+// Declarar las colas para la comunicación entre la interrupción y las tareas
+QueueHandle_t xQueueButtonPress;
+QueueHandle_t xQueueSpeedButtonPress;
+QueueHandle_t xQueueDecreaseButtonPress;
+QueueHandle_t xQueueSpeedData;
+QueueHandle_t xQueuePWMValue;
+SemaphoreHandle_t xSemaphoreMotor;
+SemaphoreHandle_t xSemaphoreSpeed;
+SemaphoreHandle_t xSemaphoreLED;
+SemaphoreHandle_t xSemaphoreBuzzer;
+SemaphoreHandle_t xMutexSpeedControl;
+
+// Prototipos de funciones
+static void vTaskHandleButtonPress(void *pvParameters);
+static void vTaskHandleSpeedButtonPress(void *pvParameters);
+static void vTaskHandleDecreaseButtonPress(void *pvParameters);
+static void vTaskControlLEDs(void *pvParameters);
+static void vTaskControlBuzzer(void *pvParameters);
+static void vTaskMonitorRPM(void *pvParameters);
+void IRAM_ATTR isrButtonPress();
+void IRAM_ATTR isrSpeedButtonPress();
+void IRAM_ATTR isrDecreaseButtonPress();
+void IRAM_ATTR isrHallSensor();
+
+// Estructura para almacenar datos del sensor Hall en la cola
+struct HallSensorData {
+    unsigned long currentTime;
+    unsigned long timeDifference;
+};
+
+TaskHandle_t xTaskHandleIncrease = NULL;
+TaskHandle_t xTaskHandleDecrease = NULL;
+
+// Configuración inicial
+void setup() {
+    Serial.begin(115200);
+
+    // Configurar los pines del botón, los LEDs, el motor, el buzzer y el sensor Hall
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    pinMode(SPEED_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(BLUE_LED_PIN, OUTPUT);
+    pinMode(GREEN_LED_PIN, OUTPUT);
+    pinMode(RED_LED_PIN, OUTPUT);
+    pinMode(MOTOR_PIN1, OUTPUT);
+    pinMode(MOTOR_PIN2, OUTPUT);
+    pinMode(MOTOR_ENABLE_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(HALL_SENSOR_PIN, INPUT);
+
+    // Configurar PWM en el ESP32
+    ledcSetup(PWM_CHANNEL, 5000, 8);  // Canal PWM 0, frecuencia 5kHz, resolución 8 bits
+    ledcAttachPin(MOTOR_ENABLE_PIN, PWM_CHANNEL);
+    ledcWrite(PWM_CHANNEL, 64);  // PWM al 25% inicialmente
+
+    // Apagar todos los LEDs, el motor y el buzzer inicialmente
+    digitalWrite(BLUE_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(MOTOR_PIN1, LOW);
+    digitalWrite(MOTOR_PIN2, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    // Crear las colas para almacenar el estado de los botones y la velocidad del motor
+    xQueueButtonPress = xQueueCreate(10, sizeof(bool));
+    xQueueSpeedButtonPress = xQueueCreate(10, sizeof(bool));
+    xQueueDecreaseButtonPress = xQueueCreate(10, sizeof(bool));
+    xQueueSpeedData = xQueueCreate(10, sizeof(float));
+    xQueuePWMValue = xQueueCreate(10, sizeof(int));  // Nueva cola para almacenar el valor PWM
+
+    //Crear semáforo mutex para incrementar/disminuir velocidad
+    xMutexSpeedControl = xSemaphoreCreateMutex();
+
+    // Crear los semáforos para proteger el estado del motor, la velocidad y los LEDs
+    xSemaphoreMotor = xSemaphoreCreateBinary();
+    xSemaphoreSpeed = xSemaphoreCreateBinary();
+    xSemaphoreLED = xSemaphoreCreateBinary();
+    xSemaphoreBuzzer = xSemaphoreCreateBinary();
+
+    xSemaphoreGive(xSemaphoreMotor);
+    xSemaphoreGive(xSemaphoreSpeed);
+    xSemaphoreGive(xSemaphoreLED);
+    xSemaphoreGive(xSemaphoreBuzzer);
+
+    if (xQueueButtonPress != NULL && xQueueSpeedButtonPress != NULL &&
+        xQueueDecreaseButtonPress != NULL && xQueueSpeedData != NULL &&
+        xQueuePWMValue != NULL && xSemaphoreMotor != NULL && xSemaphoreSpeed != NULL &&
+		xSemaphoreLED != NULL && xSemaphoreBuzzer != NULL && xMutexSpeedControl != NULL)
+    	{
+        // Inicializar el valor PWM en la cola
+        int initialPWMValue = 64;
+        xQueueSend(xQueuePWMValue, &initialPWMValue, portMAX_DELAY);
+
+        // Crear las tareas para manejar las interrupciones de los botones
+        xTaskCreatePinnedToCore(vTaskHandleButtonPress, "ButtonHandler", 4096, NULL, 3, NULL, 1);
+        xTaskCreate(vTaskHandleSpeedButtonPress, "SpeedButtonHandler", 4096, NULL, 4,&xTaskHandleDecrease);
+        xTaskCreate(vTaskHandleDecreaseButtonPress, "DecreaseButtonHandler", 4096, NULL, 4,&xTaskHandleIncrease);
+
+        // Crear la tarea para controlar los LEDs
+        xTaskCreatePinnedToCore(vTaskControlLEDs, "LEDController", 4096, NULL, 2, NULL, 1);
+
+        // Crear la tarea para controlar el buzzer
+        xTaskCreatePinnedToCore(vTaskControlBuzzer, "BuzzerController", 4096, NULL, 2, NULL, 1);
+
+        // Crear las tareas para monitorear y leer el sensor Hall
+        xTaskCreatePinnedToCore(vTaskMonitorRPM, "RPMMonitor", 4096, NULL, 2, NULL, 1);
+
+        // iniciar 'scheduler'
+        vTaskStartScheduler();
+
+        // Adjuntar la interrupción a los pines de los botones y el sensor Hall
+        attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), isrButtonPress, FALLING);
+        attachInterrupt(digitalPinToInterrupt(SPEED_BUTTON_PIN), isrSpeedButtonPress, FALLING);
+        attachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN), isrHallSensor, FALLING);
+        attachInterrupt(digitalPinToInterrupt(DECREASE_BUTTON_PIN), isrDecreaseButtonPress, FALLING);
+    } else {
+        Serial.println("Error al crear la cola o los semáforos");
+    }
+}
+
+// Interrupción que se activa al presionar el botón de encendido/apagado del motor
+void IRAM_ATTR isrButtonPress() {
+    bool buttonPressed = true;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    xQueueSendFromISR(xQueueButtonPress, &buttonPressed, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+// Interrupción que se activa al presionar el botón de disminución de velocidad del motor
+void IRAM_ATTR isrDecreaseButtonPress() {
+    bool buttonPressed = true;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    xQueueSendFromISR(xQueueDecreaseButtonPress, &buttonPressed, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// Interrupción que se activa al presionar el botón de cambio de velocidad del motor
+void IRAM_ATTR isrSpeedButtonPress() {
+    bool buttonPressed = true;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    xQueueSendFromISR(xQueueSpeedButtonPress, &buttonPressed, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// Interrupción que se activa con el sensor Hall para medir la velocidad del motor
+void IRAM_ATTR isrHallSensor() {
+    static unsigned long lastPulseTime = 0;
+    unsigned long currentTime = micros();
+    unsigned long timeDifference = currentTime - lastPulseTime;
+    lastPulseTime = currentTime;
+
+    // Calcular la velocidad en RPM
+    float rpm = (1.0 / timeDifference) * 60.0 * 1000000.0;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    xQueueSendFromISR(xQueueSpeedData, &rpm, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// Tarea que maneja el mensaje de la cola y controla el motor
+static void vTaskHandleButtonPress(void *pvParameters) {
+    bool buttonPressed;
+
+    for (;;) {
+        if (xQueueReceive(xQueueButtonPress, &buttonPressed, portMAX_DELAY) == pdPASS) {
+            Serial.println("Interrupción ocurrida: Botón Motor");
+
+            // Alternar el estado del motor
+            if (xSemaphoreTake(xSemaphoreMotor, portMAX_DELAY) == pdTRUE) {
+                bool motorState = digitalRead(MOTOR_PIN1) == HIGH;
+                if (motorState) {
+                    // Apagar el motor
+                    digitalWrite(MOTOR_PIN1, LOW);
+                    digitalWrite(MOTOR_PIN2, LOW);
+                    // Apagar todos los LEDs
+                    digitalWrite(BLUE_LED_PIN, LOW);
+                    digitalWrite(GREEN_LED_PIN, LOW);
+                    digitalWrite(RED_LED_PIN, LOW);
+                    Serial.println("Motor APAGADO");
+                } else {
+                    // Encender el motor
+                    digitalWrite(MOTOR_PIN1, HIGH);
+                    digitalWrite(MOTOR_PIN2, LOW);
+                    Serial.println("Motor ENCENDIDO");
+                }
+                xSemaphoreGive(xSemaphoreMotor);
+            }
+        }
+    }
+}
+
+// Tarea que maneja el botón de disminuir velocidad
+static void vTaskHandleSpeedButtonPress(void *pvParameters) {
+    bool buttonPressed;
+
+    for (;;) {
+        if (xQueueReceive(xQueueSpeedButtonPress, &buttonPressed, portMAX_DELAY) == pdPASS) {
+        	Serial.println("Interrupción ocurrida: Botón Disminuir Velocidad");
+        	int pwmValue;  // Valor de PWM actual
+        	// Suspender la tarea de incremento si está corriendo
+            if (xTaskHandleDecrease != NULL) {
+                vTaskDelete(xTaskHandleDecrease);
+                xTaskHandleDecrease = NULL;
+            }
+            if (xSemaphoreTake(xMutexSpeedControl, portMAX_DELAY) == pdTRUE) {  // Tomar el mutex
+            	if (xQueueReceive(xQueuePWMValue, &pwmValue, portMAX_DELAY) == pdPASS) {
+            		Serial.print("Velocidad actual del Motor: ");
+            	    Serial.print(pwmValue * 100 / 255);
+            	    Serial.println("%");
+                    vTaskPrioritySet(NULL, 5);  // Incrementar la prioridad temporalmente
+            	    // Disminuir la velocidad, asegurando que no vaya por debajo de 0
+            	    for (; pwmValue > 0; pwmValue -= 5) {
+            	    	if (pwmValue < 0) pwmValue = 0;  // Asegurar que no sea negativo
+            	    	if (xSemaphoreTake(xSemaphoreMotor, portMAX_DELAY) == pdTRUE) {
+            	    		ledcWrite(PWM_CHANNEL, pwmValue);
+            	            Serial.print("Nueva velocidad del Motor: ");
+            	            Serial.print(pwmValue * 100 / 255);
+            	            Serial.println("%");
+            	            xSemaphoreGive(xSemaphoreMotor);
+            	            }
+            	    	vTaskDelay(pdMS_TO_TICKS(150));  // Esperar 1500 ms antes del próximo decremento
+            	        }
+            	        }
+            	xQueueSend(xQueuePWMValue, &pwmValue, portMAX_DELAY);
+            	vTaskPrioritySet(NULL, 4);  // Restaurar la prioridad original
+                xSemaphoreGive(xMutexSpeedControl);  // Liberar el mutex al finalizar
+            }
+        }
+    }
+}
+
+// Tarea que maneja el botón de incrementar velocidad
+static void vTaskHandleDecreaseButtonPress(void *pvParameters) {
+    bool buttonPressed;
+
+    for (;;) {
+        if (xQueueReceive(xQueueDecreaseButtonPress, &buttonPressed, portMAX_DELAY) == pdPASS) {
+            Serial.println("Interrupción ocurrida: Botón Incrementar Velocidad");
+            int pwmValue;  // Valor de PWM actual
+        	// Suspender la tarea de decremento si está corriendo
+            if (xTaskHandleIncrease != NULL) {
+                vTaskDelete(xTaskHandleIncrease);
+                xTaskHandleIncrease = NULL;
+            }
+            if (xSemaphoreTake(xMutexSpeedControl, portMAX_DELAY) == pdTRUE) {  // Tomar el mutex
+            	if (xQueueReceive(xQueuePWMValue, &pwmValue, portMAX_DELAY) == pdPASS) {
+            		Serial.print("Velocidad actual del Motor: ");
+            	    Serial.print(pwmValue * 100 / 255);
+            	    Serial.println("%");
+            	    vTaskPrioritySet(NULL, 5);  // Incrementar la prioridad temporalmente
+            	    // Incrementar la velocidad, asegurando que no supere 255
+            	    for (; pwmValue < 255; pwmValue += 5) {
+            	    if (pwmValue > 255) pwmValue = 255;  // Asegurar que no supere 255
+            	    if (xSemaphoreTake(xSemaphoreMotor, portMAX_DELAY) == pdTRUE) {
+            	    ledcWrite(PWM_CHANNEL, pwmValue);
+            	    Serial.print("Nueva velocidad del Motor: ");
+            	    Serial.print(pwmValue * 100 / 255);
+            	    Serial.println("%");
+            	    xSemaphoreGive(xSemaphoreMotor);
+            	    }
+            	    vTaskDelay(pdMS_TO_TICKS(150));  // Esperar 1500 ms antes del próximo incremento
+            	    }
+            	    }
+            	xQueueSend(xQueuePWMValue, &pwmValue, portMAX_DELAY);
+            	vTaskPrioritySet(NULL, 4);  // Restaurar la prioridad original
+                xSemaphoreGive(xMutexSpeedControl);  // Liberar el mutex al finalizar
+            }
+        }
+    }
+}
+
+// Tarea para controlar los LEDs y mostrar en monitor serial velocidad
+static void vTaskControlLEDs(void *pvParameters) {
+    bool isMotorOn = false;
+    float rpm;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(100)); // Hacer la tarea periódica
+        if (xQueueReceive(xQueueSpeedData, &rpm, portMAX_DELAY) == pdPASS) {
+        	Serial.printf("Velocidad sensor Hall en RPM: %.2f\n", rpm);
+            // Control de LEDs según la velocidad
+            if (xSemaphoreTake(xSemaphoreLED, portMAX_DELAY) == pdTRUE) {
+			// Verificar si el motor está encendido
+			isMotorOn = digitalRead(MOTOR_PIN1) == HIGH;
+			if (isMotorOn) {
+				if (rpm <= 1100.0) {
+					digitalWrite(BLUE_LED_PIN, LOW);
+					digitalWrite(GREEN_LED_PIN, LOW);
+					digitalWrite(RED_LED_PIN, LOW);
+					} else if (rpm > 1100 && rpm <= 1200.0) {
+					digitalWrite(BLUE_LED_PIN, HIGH);
+					digitalWrite(GREEN_LED_PIN, LOW);
+					digitalWrite(RED_LED_PIN, LOW);
+					} else if (rpm > 1200.0 && rpm <=1600.0) {
+					digitalWrite(BLUE_LED_PIN, HIGH);
+					digitalWrite(GREEN_LED_PIN, HIGH);
+					digitalWrite(RED_LED_PIN, LOW);
+					}else if (rpm > 1600.0 && rpm < 2500.0) {
+					digitalWrite(BLUE_LED_PIN, HIGH);
+					digitalWrite(GREEN_LED_PIN, HIGH);
+					digitalWrite(RED_LED_PIN, HIGH);
+					}
+				}else {
+					// Apagar todos los LEDs si el motor está apagado
+					digitalWrite(BLUE_LED_PIN, LOW);
+					digitalWrite(GREEN_LED_PIN, LOW);
+					digitalWrite(RED_LED_PIN, LOW);
+					}
+			xSemaphoreGive(xSemaphoreLED);
+			}
+        }
+    }
+}
+
+// Tarea para controlar el buzzer
+static void vTaskControlBuzzer(void *pvParameters) {
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(100)); // Hacer la tarea periódica
+
+        if (xSemaphoreTake(xSemaphoreBuzzer, portMAX_DELAY) == pdTRUE) {
+            bool isMotorOn = digitalRead(MOTOR_PIN1) == HIGH;
+
+            if ((isMotorOn) && (digitalRead(RED_LED_PIN) == HIGH )) {
+                digitalWrite(BUZZER_PIN, HIGH); // Activar el buzzer si el motor está encendido
+                vTaskDelay(pdMS_TO_TICKS(100));
+                digitalWrite(BUZZER_PIN, LOW);
+            } else {
+                digitalWrite(BUZZER_PIN, LOW); // Asegurarse de que el buzzer esté apagado si el motor está apagado
+            }
+
+            xSemaphoreGive(xSemaphoreBuzzer);
+        }
+    }
+}
+
+// Tarea para monitorear el estado del motor y actualizar la velocidad en RPM
+static void vTaskMonitorRPM(void *pvParameters) {
+    float rpm;
+
+    for (;;) {
+        if (xQueueReceive(xQueueSpeedData, &rpm, portMAX_DELAY) == pdPASS) {
+        	if (rpm < 0.001) {  // Filtrar valores RPM
+        		Serial.print("Velocidad: ");
+        	    Serial.print(rpm);
+        	    Serial.println(" RPM");
+        	    }
+    }
+}
+}
+
+// Bucle principal
+void loop() {
+    // Dejar el bucle vacío porque todo se maneja en las tareas
+}
